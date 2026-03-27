@@ -1,0 +1,930 @@
+"""
+Telegram Admin Bot - Бот администратора для управления группами
+Автор: AI Assistant
+Версия: 1.0.0
+
+Функции:
+1. Бан/Разбан пользователей
+2. Мут/Размут пользователей
+3. Предупреждения (warn system)
+4. Очистка сообщений
+5. Закрепление сообщений
+6. Приветствие новых участников
+7. Антиспам защита
+8. Антифлуд защита
+9. Фильтр нежелательных слов
+10. Статистика группы
+11. Медленный режим (slowmode)
+12. Логирование действий
+"""
+
+import os
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from typing import Optional
+from functools import wraps
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ParseMode, ChatMemberStatus
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Конфигурация
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")  # ID канала для логов (опционально)
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+# ==================== ХРАНИЛИЩЕ ДАННЫХ ====================
+
+# Система предупреждений
+warnings_db: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+# {chat_id: {user_id: warn_count}}
+
+# Настройки чатов
+chat_settings: dict[int, dict] = defaultdict(lambda: {
+    "welcome_enabled": True,
+    "welcome_message": "👋 Добро пожаловать, {mention}!",
+    "antispam_enabled": True,
+    "antiflood_enabled": True,
+    "flood_limit": 5,  # сообщений
+    "flood_time": 10,  # секунд
+    "bad_words": [],
+    "max_warnings": 3,
+})
+
+# Антифлуд трекер
+flood_tracker: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+# {chat_id: {user_id: [timestamps]}}
+
+# Статистика
+stats: dict[int, dict] = defaultdict(lambda: {
+    "messages": 0,
+    "bans": 0,
+    "mutes": 0,
+    "warns": 0,
+    "deleted_messages": 0,
+})
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+def admin_required(func):
+    """Декоратор для проверки прав администратора"""
+    @wraps(func)
+    async def wrapper(message: types.Message, *args, **kwargs):
+        chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        if chat_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            await message.reply("❌ Эта команда доступна только администраторам!")
+            return
+        return await func(message, *args, **kwargs)
+    return wrapper
+
+
+async def get_target_user(message: types.Message) -> Optional[types.User]:
+    """Получить целевого пользователя из ответа или упоминания"""
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
+    
+    args = message.text.split()[1:]
+    if args:
+        try:
+            # Попытка получить по ID
+            user_id = int(args[0])
+            chat_member = await bot.get_chat_member(message.chat.id, user_id)
+            return chat_member.user
+        except (ValueError, Exception):
+            pass
+    
+    return None
+
+
+async def log_action(chat_id: int, admin: types.User, action: str, target: types.User = None, reason: str = None):
+    """Логирование действий администратора"""
+    log_text = f"📋 <b>Лог действия</b>\n\n"
+    log_text += f"👮 <b>Админ:</b> {admin.mention_html()}\n"
+    log_text += f"⚡ <b>Действие:</b> {action}\n"
+    
+    if target:
+        log_text += f"👤 <b>Цель:</b> {target.mention_html()}\n"
+    
+    if reason:
+        log_text += f"📝 <b>Причина:</b> {reason}\n"
+    
+    log_text += f"⏰ <b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    # Отправка в лог-канал если настроен
+    if LOG_CHANNEL_ID:
+        try:
+            await bot.send_message(int(LOG_CHANNEL_ID), log_text)
+        except Exception as e:
+            logger.error(f"Ошибка отправки лога: {e}")
+
+
+# ==================== 1. БАН/РАЗБАН ====================
+
+@dp.message(Command("ban"))
+@admin_required
+async def cmd_ban(message: types.Message):
+    """Забанить пользователя"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя (ответом на сообщение или ID)")
+        return
+    
+    if target.id == message.from_user.id:
+        await message.reply("❌ Вы не можете забанить себя!")
+        return
+    
+    # Получаем причину
+    args = message.text.split(maxsplit=2)
+    reason = args[2] if len(args) > 2 else "Не указана"
+    
+    try:
+        await bot.ban_chat_member(message.chat.id, target.id)
+        stats[message.chat.id]["bans"] += 1
+        
+        await message.reply(
+            f"🔨 <b>Пользователь забанен</b>\n"
+            f"👤 {target.mention_html()}\n"
+            f"📝 Причина: {reason}"
+        )
+        
+        await log_action(message.chat.id, message.from_user, "BAN", target, reason)
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("unban"))
+@admin_required
+async def cmd_unban(message: types.Message):
+    """Разбанить пользователя"""
+    args = message.text.split()
+    
+    if len(args) < 2:
+        await message.reply("❌ Укажите ID пользователя: /unban <user_id>")
+        return
+    
+    try:
+        user_id = int(args[1])
+        await bot.unban_chat_member(message.chat.id, user_id, only_if_banned=True)
+        
+        await message.reply(f"✅ Пользователь {user_id} разбанен")
+        await log_action(message.chat.id, message.from_user, "UNBAN")
+        
+    except ValueError:
+        await message.reply("❌ Неверный ID пользователя")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 2. МУТ/РАЗМУТ ====================
+
+@dp.message(Command("mute"))
+@admin_required
+async def cmd_mute(message: types.Message):
+    """Замутить пользователя"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя (ответом на сообщение или ID)")
+        return
+    
+    # Парсинг времени
+    args = message.text.split()
+    duration_minutes = 60  # По умолчанию 1 час
+    reason = "Не указана"
+    
+    if len(args) > 1:
+        try:
+            duration_minutes = int(args[1])
+        except ValueError:
+            pass
+    
+    if len(args) > 2:
+        reason = " ".join(args[2:])
+    
+    until_date = datetime.now() + timedelta(minutes=duration_minutes)
+    
+    try:
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date
+        )
+        stats[message.chat.id]["mutes"] += 1
+        
+        await message.reply(
+            f"🔇 <b>Пользователь замучен</b>\n"
+            f"👤 {target.mention_html()}\n"
+            f"⏱ Длительность: {duration_minutes} мин.\n"
+            f"📝 Причина: {reason}"
+        )
+        
+        await log_action(message.chat.id, message.from_user, f"MUTE ({duration_minutes} мин)", target, reason)
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("unmute"))
+@admin_required
+async def cmd_unmute(message: types.Message):
+    """Размутить пользователя"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя")
+        return
+    
+    try:
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+        
+        await message.reply(f"🔊 Пользователь {target.mention_html()} размучен")
+        await log_action(message.chat.id, message.from_user, "UNMUTE", target)
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 3. СИСТЕМА ПРЕДУПРЕЖДЕНИЙ ====================
+
+@dp.message(Command("warn"))
+@admin_required
+async def cmd_warn(message: types.Message):
+    """Выдать предупреждение"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя")
+        return
+    
+    args = message.text.split(maxsplit=2)
+    reason = args[2] if len(args) > 2 else "Не указана"
+    
+    warnings_db[message.chat.id][target.id] += 1
+    current_warns = warnings_db[message.chat.id][target.id]
+    max_warns = chat_settings[message.chat.id]["max_warnings"]
+    
+    stats[message.chat.id]["warns"] += 1
+    
+    await message.reply(
+        f"⚠️ <b>Предупреждение</b>\n"
+        f"👤 {target.mention_html()}\n"
+        f"📊 Предупреждений: {current_warns}/{max_warns}\n"
+        f"📝 Причина: {reason}"
+    )
+    
+    await log_action(message.chat.id, message.from_user, f"WARN ({current_warns}/{max_warns})", target, reason)
+    
+    # Автобан при превышении лимита
+    if current_warns >= max_warns:
+        try:
+            await bot.ban_chat_member(message.chat.id, target.id)
+            warnings_db[message.chat.id][target.id] = 0
+            
+            await message.reply(
+                f"🔨 {target.mention_html()} автоматически забанен за превышение лимита предупреждений!"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка автобана: {e}")
+
+
+@dp.message(Command("unwarn"))
+@admin_required
+async def cmd_unwarn(message: types.Message):
+    """Снять предупреждение"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя")
+        return
+    
+    if warnings_db[message.chat.id][target.id] > 0:
+        warnings_db[message.chat.id][target.id] -= 1
+    
+    current_warns = warnings_db[message.chat.id][target.id]
+    max_warns = chat_settings[message.chat.id]["max_warnings"]
+    
+    await message.reply(
+        f"✅ Предупреждение снято\n"
+        f"👤 {target.mention_html()}\n"
+        f"📊 Предупреждений: {current_warns}/{max_warns}"
+    )
+
+
+@dp.message(Command("warns"))
+async def cmd_warns(message: types.Message):
+    """Показать предупреждения пользователя"""
+    target = await get_target_user(message)
+    
+    if not target:
+        target = message.from_user
+    
+    current_warns = warnings_db[message.chat.id][target.id]
+    max_warns = chat_settings[message.chat.id]["max_warnings"]
+    
+    await message.reply(
+        f"📊 <b>Предупреждения</b>\n"
+        f"👤 {target.mention_html()}\n"
+        f"⚠️ Предупреждений: {current_warns}/{max_warns}"
+    )
+
+
+# ==================== 4. ОЧИСТКА СООБЩЕНИЙ ====================
+
+@dp.message(Command("clear", "purge"))
+@admin_required
+async def cmd_clear(message: types.Message):
+    """Очистить сообщения"""
+    args = message.text.split()
+    count = 10  # По умолчанию
+    
+    if len(args) > 1:
+        try:
+            count = min(int(args[1]), 100)  # Максимум 100
+        except ValueError:
+            pass
+    
+    deleted = 0
+    
+    try:
+        # Получаем сообщения для удаления
+        # В реальности нужно использовать message_id и удалять по одному
+        for i in range(count):
+            try:
+                await bot.delete_message(message.chat.id, message.message_id - i)
+                deleted += 1
+            except Exception:
+                continue
+        
+        stats[message.chat.id]["deleted_messages"] += deleted
+        
+        notification = await message.answer(f"🗑 Удалено {deleted} сообщений")
+        await asyncio.sleep(3)
+        await notification.delete()
+        
+        await log_action(message.chat.id, message.from_user, f"CLEAR ({deleted} сообщений)")
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 5. ЗАКРЕПЛЕНИЕ СООБЩЕНИЙ ====================
+
+@dp.message(Command("pin"))
+@admin_required
+async def cmd_pin(message: types.Message):
+    """Закрепить сообщение"""
+    if not message.reply_to_message:
+        await message.reply("❌ Ответьте на сообщение, которое нужно закрепить")
+        return
+    
+    try:
+        await bot.pin_chat_message(
+            message.chat.id,
+            message.reply_to_message.message_id,
+            disable_notification=False
+        )
+        await message.reply("📌 Сообщение закреплено!")
+        await log_action(message.chat.id, message.from_user, "PIN MESSAGE")
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("unpin"))
+@admin_required
+async def cmd_unpin(message: types.Message):
+    """Открепить сообщение"""
+    try:
+        await bot.unpin_chat_message(message.chat.id)
+        await message.reply("📌 Сообщение откреплено!")
+        await log_action(message.chat.id, message.from_user, "UNPIN MESSAGE")
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("unpin_all"))
+@admin_required
+async def cmd_unpin_all(message: types.Message):
+    """Открепить все сообщения"""
+    try:
+        await bot.unpin_all_chat_messages(message.chat.id)
+        await message.reply("📌 Все сообщения откреплены!")
+        await log_action(message.chat.id, message.from_user, "UNPIN ALL")
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 6. ПРИВЕТСТВИЕ НОВЫХ УЧАСТНИКОВ ====================
+
+@dp.message(Command("setwelcome"))
+@admin_required
+async def cmd_set_welcome(message: types.Message):
+    """Установить приветственное сообщение"""
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.reply(
+            "📝 <b>Использование:</b> /setwelcome <текст>\n\n"
+            "<b>Переменные:</b>\n"
+            "{mention} - упоминание пользователя\n"
+            "{name} - имя пользователя\n"
+            "{chat} - название чата"
+        )
+        return
+    
+    chat_settings[message.chat.id]["welcome_message"] = args[1]
+    await message.reply("✅ Приветственное сообщение установлено!")
+
+
+@dp.message(Command("welcome"))
+@admin_required
+async def cmd_toggle_welcome(message: types.Message):
+    """Включить/выключить приветствие"""
+    args = message.text.split()
+    
+    if len(args) > 1:
+        if args[1].lower() in ["on", "вкл", "1"]:
+            chat_settings[message.chat.id]["welcome_enabled"] = True
+            await message.reply("✅ Приветствия включены")
+        elif args[1].lower() in ["off", "выкл", "0"]:
+            chat_settings[message.chat.id]["welcome_enabled"] = False
+            await message.reply("❌ Приветствия выключены")
+    else:
+        status = "включены" if chat_settings[message.chat.id]["welcome_enabled"] else "выключены"
+        await message.reply(f"👋 Приветствия: {status}\n\nИспользуйте: /welcome on/off")
+
+
+@dp.chat_member()
+async def on_chat_member_update(update: types.ChatMemberUpdated):
+    """Обработка входа новых участников"""
+    if update.new_chat_member.status == ChatMemberStatus.MEMBER and \
+       update.old_chat_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
+        
+        if not chat_settings[update.chat.id]["welcome_enabled"]:
+            return
+        
+        user = update.new_chat_member.user
+        welcome_text = chat_settings[update.chat.id]["welcome_message"]
+        
+        welcome_text = welcome_text.format(
+            mention=user.mention_html(),
+            name=user.full_name,
+            chat=update.chat.title or "чат"
+        )
+        
+        await bot.send_message(update.chat.id, welcome_text)
+
+
+# ==================== 7. АНТИСПАМ ====================
+
+@dp.message(Command("antispam"))
+@admin_required
+async def cmd_antispam(message: types.Message):
+    """Включить/выключить антиспам"""
+    args = message.text.split()
+    
+    if len(args) > 1:
+        if args[1].lower() in ["on", "вкл", "1"]:
+            chat_settings[message.chat.id]["antispam_enabled"] = True
+            await message.reply("✅ Антиспам включен")
+        elif args[1].lower() in ["off", "выкл", "0"]:
+            chat_settings[message.chat.id]["antispam_enabled"] = False
+            await message.reply("❌ Антиспам выключен")
+    else:
+        status = "включен" if chat_settings[message.chat.id]["antispam_enabled"] else "выключен"
+        await message.reply(f"🛡 Антиспам: {status}\n\nИспользуйте: /antispam on/off")
+
+
+@dp.message(Command("addword"))
+@admin_required
+async def cmd_add_bad_word(message: types.Message):
+    """Добавить запрещенное слово"""
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.reply("❌ Укажите слово: /addword <слово>")
+        return
+    
+    word = args[1].lower()
+    if word not in chat_settings[message.chat.id]["bad_words"]:
+        chat_settings[message.chat.id]["bad_words"].append(word)
+        await message.reply(f"✅ Слово «{word}» добавлено в фильтр")
+    else:
+        await message.reply("❌ Это слово уже в фильтре")
+
+
+@dp.message(Command("delword"))
+@admin_required
+async def cmd_del_bad_word(message: types.Message):
+    """Удалить запрещенное слово"""
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.reply("❌ Укажите слово: /delword <слово>")
+        return
+    
+    word = args[1].lower()
+    if word in chat_settings[message.chat.id]["bad_words"]:
+        chat_settings[message.chat.id]["bad_words"].remove(word)
+        await message.reply(f"✅ Слово «{word}» удалено из фильтра")
+    else:
+        await message.reply("❌ Слово не найдено в фильтре")
+
+
+@dp.message(Command("badwords"))
+@admin_required
+async def cmd_list_bad_words(message: types.Message):
+    """Показать список запрещенных слов"""
+    words = chat_settings[message.chat.id]["bad_words"]
+    
+    if words:
+        await message.reply(f"🚫 <b>Запрещенные слова:</b>\n{', '.join(words)}")
+    else:
+        await message.reply("📝 Список запрещенных слов пуст")
+
+
+# ==================== 8. АНТИФЛУД ====================
+
+@dp.message(Command("antiflood"))
+@admin_required
+async def cmd_antiflood(message: types.Message):
+    """Настройка антифлуда"""
+    args = message.text.split()
+    
+    if len(args) == 1:
+        status = "включен" if chat_settings[message.chat.id]["antiflood_enabled"] else "выключен"
+        limit = chat_settings[message.chat.id]["flood_limit"]
+        time = chat_settings[message.chat.id]["flood_time"]
+        
+        await message.reply(
+            f"🌊 <b>Антифлуд</b>\n\n"
+            f"Статус: {status}\n"
+            f"Лимит: {limit} сообщений за {time} секунд\n\n"
+            f"/antiflood on/off - вкл/выкл\n"
+            f"/antiflood set <лимит> <время>"
+        )
+        return
+    
+    if args[1].lower() in ["on", "вкл"]:
+        chat_settings[message.chat.id]["antiflood_enabled"] = True
+        await message.reply("✅ Антифлуд включен")
+    elif args[1].lower() in ["off", "выкл"]:
+        chat_settings[message.chat.id]["antiflood_enabled"] = False
+        await message.reply("❌ Антифлуд выключен")
+    elif args[1].lower() == "set" and len(args) >= 4:
+        try:
+            limit = int(args[2])
+            time = int(args[3])
+            chat_settings[message.chat.id]["flood_limit"] = limit
+            chat_settings[message.chat.id]["flood_time"] = time
+            await message.reply(f"✅ Лимит: {limit} сообщений за {time} секунд")
+        except ValueError:
+            await message.reply("❌ Неверные параметры")
+
+
+async def check_flood(message: types.Message) -> bool:
+    """Проверка на флуд"""
+    if not chat_settings[message.chat.id]["antiflood_enabled"]:
+        return False
+    
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    # Проверяем, не админ ли
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            return False
+    except Exception:
+        pass
+    
+    now = datetime.now()
+    flood_time = chat_settings[chat_id]["flood_time"]
+    flood_limit = chat_settings[chat_id]["flood_limit"]
+    
+    # Очищаем старые записи
+    flood_tracker[chat_id][user_id] = [
+        t for t in flood_tracker[chat_id][user_id]
+        if (now - t).total_seconds() < flood_time
+    ]
+    
+    # Добавляем текущее сообщение
+    flood_tracker[chat_id][user_id].append(now)
+    
+    # Проверяем лимит
+    if len(flood_tracker[chat_id][user_id]) > flood_limit:
+        return True
+    
+    return False
+
+
+# ==================== 9. СТАТИСТИКА ====================
+
+@dp.message(Command("stats"))
+@admin_required
+async def cmd_stats(message: types.Message):
+    """Показать статистику чата"""
+    chat_stats = stats[message.chat.id]
+    
+    await message.reply(
+        f"📊 <b>Статистика чата</b>\n\n"
+        f"💬 Сообщений: {chat_stats['messages']}\n"
+        f"🔨 Банов: {chat_stats['bans']}\n"
+        f"🔇 Мутов: {chat_stats['mutes']}\n"
+        f"⚠️ Предупреждений: {chat_stats['warns']}\n"
+        f"🗑 Удалено сообщений: {chat_stats['deleted_messages']}"
+    )
+
+
+@dp.message(Command("chatinfo"))
+async def cmd_chat_info(message: types.Message):
+    """Информация о чате"""
+    chat = await bot.get_chat(message.chat.id)
+    members_count = await bot.get_chat_member_count(message.chat.id)
+    
+    info = f"📋 <b>Информация о чате</b>\n\n"
+    info += f"📝 Название: {chat.title}\n"
+    info += f"🆔 ID: <code>{chat.id}</code>\n"
+    info += f"👥 Участников: {members_count}\n"
+    info += f"📌 Тип: {chat.type}\n"
+    
+    if chat.username:
+        info += f"🔗 Username: @{chat.username}\n"
+    
+    if chat.description:
+        info += f"\n📄 Описание: {chat.description}"
+    
+    await message.reply(info)
+
+
+@dp.message(Command("userinfo"))
+async def cmd_user_info(message: types.Message):
+    """Информация о пользователе"""
+    target = await get_target_user(message)
+    
+    if not target:
+        target = message.from_user
+    
+    member = await bot.get_chat_member(message.chat.id, target.id)
+    warns = warnings_db[message.chat.id][target.id]
+    
+    info = f"👤 <b>Информация о пользователе</b>\n\n"
+    info += f"📝 Имя: {target.full_name}\n"
+    info += f"🆔 ID: <code>{target.id}</code>\n"
+    
+    if target.username:
+        info += f"🔗 Username: @{target.username}\n"
+    
+    info += f"🛡 Статус: {member.status.value}\n"
+    info += f"⚠️ Предупреждений: {warns}/{chat_settings[message.chat.id]['max_warnings']}\n"
+    
+    await message.reply(info)
+
+
+# ==================== 10. МЕДЛЕННЫЙ РЕЖИМ ====================
+
+@dp.message(Command("slowmode"))
+@admin_required
+async def cmd_slowmode(message: types.Message):
+    """Установить медленный режим"""
+    args = message.text.split()
+    
+    if len(args) < 2:
+        await message.reply(
+            "🐢 <b>Медленный режим</b>\n\n"
+            "Использование: /slowmode <секунды>\n"
+            "Для отключения: /slowmode 0\n\n"
+            "Допустимые значения: 0, 10, 30, 60, 300, 900, 3600"
+        )
+        return
+    
+    try:
+        seconds = int(args[1])
+        allowed = [0, 10, 30, 60, 300, 900, 3600]
+        
+        if seconds not in allowed:
+            # Находим ближайшее допустимое значение
+            seconds = min(allowed, key=lambda x: abs(x - seconds))
+        
+        await bot.set_chat_slow_mode_delay(message.chat.id, seconds)
+        
+        if seconds == 0:
+            await message.reply("✅ Медленный режим отключен")
+        else:
+            await message.reply(f"✅ Медленный режим: {seconds} сек.")
+        
+        await log_action(message.chat.id, message.from_user, f"SLOWMODE ({seconds}s)")
+        
+    except ValueError:
+        await message.reply("❌ Укажите число секунд")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 11. КИК ====================
+
+@dp.message(Command("kick"))
+@admin_required
+async def cmd_kick(message: types.Message):
+    """Кикнуть пользователя (может вернуться)"""
+    target = await get_target_user(message)
+    
+    if not target:
+        await message.reply("❌ Укажите пользователя")
+        return
+    
+    args = message.text.split(maxsplit=2)
+    reason = args[2] if len(args) > 2 else "Не указана"
+    
+    try:
+        await bot.ban_chat_member(message.chat.id, target.id)
+        await bot.unban_chat_member(message.chat.id, target.id)
+        
+        await message.reply(
+            f"👢 <b>Пользователь кикнут</b>\n"
+            f"👤 {target.mention_html()}\n"
+            f"📝 Причина: {reason}"
+        )
+        
+        await log_action(message.chat.id, message.from_user, "KICK", target, reason)
+        
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# ==================== 12. ПОМОЩЬ ====================
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    """Команда /start"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📚 Команды", callback_data="help")],
+        [InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/{(await bot.me()).username}?startgroup=true")]
+    ])
+    
+    await message.reply(
+        f"👋 <b>Привет!</b>\n\n"
+        f"Я бот-администратор для управления группами.\n\n"
+        f"Добавьте меня в группу и выдайте права администратора.",
+        reply_markup=keyboard
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    """Список команд"""
+    help_text = """
+📚 <b>Команды бота</b>
+
+<b>👮 Модерация:</b>
+/ban - Забанить пользователя
+/unban - Разбанить пользователя
+/kick - Кикнуть пользователя
+/mute [минуты] - Замутить
+/unmute - Размутить
+
+<b>⚠️ Предупреждения:</b>
+/warn - Выдать предупреждение
+/unwarn - Снять предупреждение
+/warns - Показать предупреждения
+
+<b>📝 Сообщения:</b>
+/clear [кол-во] - Удалить сообщения
+/pin - Закрепить сообщение
+/unpin - Открепить сообщение
+/unpin_all - Открепить все
+
+<b>👋 Приветствия:</b>
+/welcome on/off - Вкл/Выкл
+/setwelcome - Установить текст
+
+<b>🛡 Защита:</b>
+/antispam on/off - Антиспам
+/antiflood on/off - Антифлуд
+/addword - Добавить запрещенное слово
+/delword - Удалить слово
+/badwords - Список слов
+/slowmode [сек] - Медленный режим
+
+<b>📊 Информация:</b>
+/stats - Статистика чата
+/chatinfo - Информация о чате
+/userinfo - Информация о пользователе
+"""
+    await message.reply(help_text)
+
+
+@dp.callback_query(F.data == "help")
+async def callback_help(callback: types.CallbackQuery):
+    """Обработка нажатия кнопки помощи"""
+    await cmd_help(callback.message)
+    await callback.answer()
+
+
+# ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
+
+@dp.message()
+async def on_message(message: types.Message):
+    """Обработка всех сообщений"""
+    if not message.text:
+        return
+    
+    chat_id = message.chat.id
+    
+    # Статистика
+    stats[chat_id]["messages"] += 1
+    
+    # Проверка на админа
+    try:
+        member = await bot.get_chat_member(chat_id, message.from_user.id)
+        is_admin = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except Exception:
+        is_admin = False
+    
+    if is_admin:
+        return
+    
+    # Антиспам - проверка на запрещенные слова
+    if chat_settings[chat_id]["antispam_enabled"]:
+        text_lower = message.text.lower()
+        for word in chat_settings[chat_id]["bad_words"]:
+            if word in text_lower:
+                try:
+                    await message.delete()
+                    stats[chat_id]["deleted_messages"] += 1
+                    
+                    warning = await message.answer(
+                        f"⚠️ {message.from_user.mention_html()}, использование запрещенных слов!"
+                    )
+                    await asyncio.sleep(5)
+                    await warning.delete()
+                except Exception:
+                    pass
+                return
+    
+    # Антифлуд
+    if await check_flood(message):
+        try:
+            await bot.restrict_chat_member(
+                chat_id,
+                message.from_user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=datetime.now() + timedelta(minutes=5)
+            )
+            
+            await message.reply(
+                f"🌊 {message.from_user.mention_html()} замучен на 5 минут за флуд!"
+            )
+            
+            stats[chat_id]["mutes"] += 1
+            flood_tracker[chat_id][message.from_user.id] = []
+        except Exception as e:
+            logger.error(f"Ошибка антифлуда: {e}")
+
+
+# ==================== ЗАПУСК БОТА ====================
+
+async def main():
+    """Запуск бота"""
+    logger.info("Запуск бота...")
+    
+    # Удаление вебхука и очистка pending обновлений
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запуск polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
